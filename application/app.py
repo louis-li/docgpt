@@ -23,6 +23,8 @@ import dotenv, os
 from langchain.vectorstores.redis import Redis
 from langchain.embeddings import OpenAIEmbeddings
 import ast
+from AzureOpenAIUtil.AzureFormRecognizer import AzureFormRecognizerRead
+
 
 from error import bad_request
 
@@ -38,61 +40,7 @@ if platform.system() == "Windows":
     temp = pathlib.PosixPath
     pathlib.PosixPath = pathlib.WindowsPath
 
-def load_data():
-    import os, json
-    from langchain.document_loaders import UnstructuredMarkdownLoader
-    from langchain.text_splitter import MarkdownTextSplitter
-    from urllib.parse import quote
-    
-    from langchain.embeddings import OpenAIEmbeddings
-    from langchain.vectorstores.redis import Redis
 
-    excluded_files = ['SECURITY.md','SUPPORT.md', 'CODE_OF_CONDUCT.md', 'MIP-Readiness-Learning-Paths.md']
-    text_splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=200)
-    # text_splitter = CharacterTextSplitter(
-    #     separator="\n",
-    #     chunk_size=1000, 
-    #     chunk_overlap=200)
-
-    def collect_document(source_path_list, replace_url_list):
-        docs = []
-        for source_path, replace_url in zip(source_path_list, replace_url_list):
-            for root, folder, files in os.walk(source_path):
-                for f in files:
-                    if f[-2:]=='md' and f not in excluded_files:
-                        # print(root,f)
-                        try:
-                            loader = UnstructuredMarkdownLoader(os.path.join(root, f))
-                            data=loader.load()
-                            
-                            split_docs = text_splitter.create_documents([d.page_content for d in data])
-                            for sd in split_docs:
-                                id = os.path.join(root, f).replace(source_path,replace_url ).replace('\\', '/').replace('/csu-data_ai-main','').replace(' ','%20')
-                                sd.metadata['source'] = id
-                                docs.append(sd)
-                        except Exception as e:
-                            print(f'** Unable to load file {os.path.join(root,f)}')
-                            print(e)
-        return docs
-    
-    docs = collect_document(['./data/csu-data_ai-main'], 
-                        ['https://github.com/customer-success-microsoft/csu-data_ai/blob/main'])
-    print(f'Number of documents: {len(docs)}')
-
-    redis_url = os.getenv("REDIS_URL") if os.getenv("DOCKER_REDIS_URL") is None else os.getenv("DOCKER_REDIS_URL")
-
-    embeddings = OpenAIEmbeddings(model=os.getenv("EMBEDDINGS_NAME"))
-    vector_name='vbd_index'
-    rds = Redis.from_documents([docs[0]], 
-                            embeddings, 
-                            redis_url=redis_url,  
-                            index_name=vector_name)
-    starting_idx = 1
-    rds.add_documents(docs[starting_idx:])
-    print('Redis Index created:', rds.index_name)
-        
-
-app = Flask(__name__)
 
 # openai.api_type = "azure"
 # openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -118,23 +66,10 @@ messages_question = [
 ]
 p_chat_question = ChatPromptTemplate.from_messages(messages_question)
 
-redis_url = os.getenv("REDIS_URL") if os.getenv("DOCKER_REDIS_URL") is None else os.getenv("DOCKER_REDIS_URL")
-
-vector_name='vbd_index'
-
-embeddings = OpenAIEmbeddings(model=os.getenv("EMBEDDINGS_NAME"))
-
-
-try:
-    rds = Redis.from_existing_index(embeddings, redis_url=redis_url, index_name=vector_name)
-    print('Index found.')
+app = Flask(__name__)
+rds = None
+embeddings = OpenAIEmbeddings(model=os.getenv("EMBEDDINGS_NAME"),deployment=os.getenv("EMBEDDINGS_NAME"))
     
-except:
-    print('Index not found, creating new index')
-    load_data()
-    rds = Redis.from_existing_index(embeddings, redis_url=redis_url, index_name=vector_name)
-
-print("Redis index loaded.")
 async def async_generate(chain, question, chat_history):
     result = await chain.arun({"question": question, "chat_history": chat_history})
     return result
@@ -155,11 +90,63 @@ def run_async_chain(chain, question, chat_history):
 def home():
     return render_template("index.html")
 
+
+@app.route("/api/index",methods=["GET"])
+def api_index():
+    def load_data():
+        azure_fr = AzureFormRecognizerRead()
+        extracted_folder = './data/jsons'
+        azure_fr.extract_files('./data/pdfs', extracted_folder)
+
+        # Extract text from JSON files from extracted folder
+        from langchain.text_splitter import CharacterTextSplitter
+        from langchain.schema import Document
+
+        docs = []
+        for file in os.listdir(extracted_folder):
+            print('Loading file:', file)
+            with open(os.path.join(extracted_folder, file)) as f:
+                page_content= json.loads(f.read())
+            docs.extend([Document(page_content = page['page_content'], metadata={'source': file[:-4] + str(page['page_number'])}) for page in page_content['content']])
+        
+        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+        processed_docs = text_splitter.split_documents(docs)
+
+        # check if redis index already exists
+        rds = Redis.from_documents([processed_docs[0]], 
+                                embeddings, 
+                                redis_url=redis_url,  
+                                index_name=vector_name)
+        starting_idx = 1
+
+        # add documents to redis index
+        rds.add_documents(processed_docs[starting_idx:])
+        print('Redis Index created:', rds.index_name)
+    
+    redis_url = os.getenv("REDIS_URL") if os.getenv("DOCKER_REDIS_URL") is None else os.getenv("DOCKER_REDIS_URL")
+
+    vector_name='doc_index_3'
+
+    global rds
+
+    try:
+        rds = Redis.from_existing_index(embeddings, redis_url=redis_url, index_name=vector_name)
+        print('Index found.')
+        
+    except:
+        print('Index not found, creating new index')
+        load_data()
+        print('Index created')
+        rds = Redis.from_existing_index(embeddings, redis_url=redis_url, index_name=vector_name)
+
+    print("Redis index loaded.")
+    return "Redis index loaded."
+
 @app.route("/api/answer", methods=["POST"])
 def api_answer():
     data = request.get_json()
     question = data["question"]
-    if data['history'] != '[""]':
+    if data['history'] != '[""]' and data['history'] != 'undefined':
         history =  [(h1.replace("<br>", "\n"),h2.replace("<br>", "\n")) for h1,h2 in ast.literal_eval(data["history"])]
         # idx = 0
         # history = []
@@ -180,6 +167,8 @@ def api_answer():
     doc_chain = load_qa_with_sources_chain(llm, chain_type="map_reduce", 
                                         question_prompt=p_chat_question,
                                         combine_prompt=p_chat_combine)
+    if rds == None:
+        api_index()
     chain = ConversationalRetrievalChain(
         retriever=rds.as_retriever(search_type="similarity"),
         question_generator=question_generator,

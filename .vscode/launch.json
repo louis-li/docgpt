@@ -19,7 +19,7 @@
             "type": "python",
             "request": "launch",
             "program": "app.py",
-            "cwd": "c:/code/VbdGPT/application",
+            "cwd": "c:/code/ChatDoc/application",
             "console": "integratedTerminal",
             "justMyCode": false,
             
